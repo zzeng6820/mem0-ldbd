@@ -1,0 +1,17 @@
+[Unit]
+Description=LDBD Mem0 Platform adapter
+After=network-online.target
+
+[Service]
+Type=simple
+# Replace /absolute/path/to/ldbd_mem0 with your checkout directory.
+WorkingDirectory=/absolute/path/to/ldbd_mem0
+ExecStart=/absolute/path/to/ldbd_mem0/.venv/bin/python scripts/run.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+TimeoutStopSec=40
+
+[Install]
+WantedBy=default.target

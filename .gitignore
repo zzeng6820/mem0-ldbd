@@ -1,0 +1,34 @@
+# Runtime credentials; publish only the empty example.
+.env*
+!.env.example
+.venv/
+venv/
+data/
+logs/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log
+*.db
+*.db-*
+*.sqlite*
+
+# Server-only runbooks, units and recovery archives.
+.private/
+*.private.md
+/ldbd-mem0.service
+/SHA256SUMS
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.bak
+*.backup
+
+# Credential exports and private keys.
+credentials*.json
+secrets*.json
+*.pem
+*.key
+id_rsa
+id_ed25519
