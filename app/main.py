@@ -7,20 +7,29 @@ import json
 from typing import Literal
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from .config import Settings
+from .content import Content, MAX_ADD_IMAGE_BYTES, add_image_bytes, project_text
 from .store import RequestStore
 from .upstream import Mem0Upstream, UpstreamError
 
 
 class Message(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    role: Literal["user", "assistant", "system"]
-    content: str = Field(min_length=1)
+    role: Literal["user", "assistant"]
+    content: Content
     timestamp: StrictInt | None = None
+
+    @field_validator("content")
+    @classmethod
+    def nonblank_content(cls, value):
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("Message content must not be blank")
+        return value
 
 
 class AddRequest(BaseModel):
@@ -49,18 +58,26 @@ class SearchOptions(BaseModel):
 
 class SearchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    query: str = Field(min_length=1)
+    query: Content
     user_id: str = Field(min_length=1, max_length=1024)
-    top_k: int = Field(default=100, ge=1, le=1000)
+    top_k: StrictInt = Field(ge=1, le=1000)
+    options: list[str] | None = None
     search_options: SearchOptions | None = None
 
     @field_validator("query", "user_id")
     @classmethod
     def nonblank(cls, value, info):
-        if not value.strip():
+        if isinstance(value, str) and not value.strip():
             raise ValueError("Value must not be blank")
         if info.field_name == "user_id" and "*" in value:
             raise ValueError("Wildcard user IDs are not allowed")
+        return value
+
+    @field_validator("options")
+    @classmethod
+    def valid_choices(cls, value):
+        if value is not None and any(not option.strip() for option in value):
+            raise ValueError("Options must contain nonblank strings")
         return value
 
 
@@ -84,8 +101,49 @@ def create_app(settings: Settings | None = None, transport=None):
                 task.cancel()
             await asyncio.gather(*tasks.values(), return_exceptions=True)
 
-    app = FastAPI(title="LDBD Mem0 compatible service", version="reconstructed-2026.10.22",
+    app = FastAPI(title="LDBD Mem0 compatible service", version="aml-text-compatible-2026.10.23",
                   lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, exc: RequestValidationError):
+        # FastAPI's default response includes the invalid input, which could be
+        # tens of MiB of Base64 or private evaluation text. Even msg and unknown
+        # field names can contain input (e.g. an invalid discriminated-union tag).
+        known_fields = {
+            "body", "request_id", "user_id", "session_id", "messages", "role",
+            "timestamp", "content", "async_mode", "query", "top_k", "options",
+            "search_options", "threshold", "rerank", "type", "text", "image_url",
+            "url", "str",
+        }
+        messages = {
+            "missing": "Required field is missing",
+            "extra_forbidden": "Unexpected field",
+            "union_tag_invalid": "Content part type must be text or image_url",
+            "union_tag_not_found": "Content part must include a type",
+            "string_type": "Expected a string",
+            "int_type": "Expected an integer",
+            "list_type": "Expected an array",
+            "literal_error": "Value is not supported by the API contract",
+        }
+        safe_custom = {
+            "Images must be inline Base64 JPEG, PNG or WebP data URIs",
+            "Decoded image exceeds the 10 MiB limit", "Image contains invalid Base64",
+            "Image must not be empty", "Text part must not be blank",
+            "Message content must not be blank", "ID must not be blank",
+            "Wildcard user IDs are not allowed", "Value must not be blank",
+            "Options must contain nonblank strings",
+        }
+        errors = []
+        for error in exc.errors():
+            code = error["type"]
+            message = messages.get(code, "Invalid field value; check the API contract")
+            custom = str(error.get("ctx", {}).get("error", ""))
+            if code == "value_error" and custom in safe_custom:
+                message = custom
+            location = [part if isinstance(part, int) or part in known_fields else "<field>"
+                        for part in error["loc"]]
+            errors.append({"loc": location, "msg": message, "type": code})
+        return JSONResponse({"detail": errors}, status_code=422)
 
     def authorized(x_api_key: str | None = Header(default=None)):
         if not settings.wrapper_api_key:
@@ -105,7 +163,7 @@ def create_app(settings: Settings | None = None, transport=None):
     async def live():
         return {"status": "ok"}
 
-    async def perform_add(payload, existing, is_new):
+    async def perform_add(payload, existing, is_new, ignored_images=0):
         store = app.state.store
         user, request = payload["user_id"], payload["request_id"]
         try:
@@ -123,6 +181,9 @@ def create_app(settings: Settings | None = None, transport=None):
                     await app.state.upstream.wait_events(event_ids)
                 response = {"success": True, "request_id": request, "user_id": user,
                             "session_id": payload["session_id"]}
+                if ignored_images:
+                    response.update(ignored_image_parts=ignored_images,
+                                    warnings=["Image content was ignored in text-only mode."])
                 store.update(user, request, "completed", response=response)
                 return response
         except UpstreamError as exc:
@@ -141,7 +202,17 @@ def create_app(settings: Settings | None = None, transport=None):
     @app.post("/v1/memories/add", dependencies=[Depends(authorized)])
     async def add(body: AddRequest):
         payload = body.model_dump(exclude_none=True, exclude={"async_mode"})
+        if add_image_bytes(payload["messages"]) > MAX_ADD_IMAGE_BYTES:
+            raise HTTPException(413, "Decoded images exceed the 30 MiB per-Add limit")
+        projected_messages = []
+        ignored_images = 0
+        for message in payload["messages"]:
+            content, count = project_text(message["content"])
+            ignored_images += count
+            if content.strip():
+                projected_messages.append({**message, "content": content})
         key = (body.user_id, body.request_id)
+        # Fingerprint the original request, including image parts that are skipped.
         fingerprint = hashlib.sha256(json.dumps(
             {"payload": payload, "upstream": settings.mem0_base_url, "mode": settings.mem0_api_mode},
             ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -152,13 +223,25 @@ def create_app(settings: Settings | None = None, transport=None):
             raise HTTPException(409, "request_id is bound to a different payload")
         if row["state"] == "completed":
             return json.loads(row["response"])
+        if not projected_messages:
+            # An image-only request is a successful local no-op. Persist its
+            # receipt, including after a crash between claim and completion;
+            # this branch never submits a write to the upstream service.
+            response = {"success": True, "request_id": body.request_id,
+                        "user_id": body.user_id, "session_id": body.session_id,
+                        "no_op": True, "ignored_image_parts": ignored_images,
+                        "warnings": ["Image content was ignored in text-only mode. "
+                                     "No text remained; no memories were written."]}
+            store.update(*key, "completed", response=response)
+            return response
         task = tasks.get(key)
         if task is None:
             if row["state"] in {"uncertain", "submitted"} and not is_new:
                 raise HTTPException(503, "Previous add outcome is unknown; reconcile before resubmitting")
             if row["state"] == "failed":
                 raise HTTPException(row["status_code"] or 502, row["error"] or "Upstream add failed")
-            task = asyncio.create_task(perform_add(payload, row, is_new))
+            task = asyncio.create_task(perform_add(
+                {**payload, "messages": projected_messages}, row, is_new, ignored_images))
             tasks[key] = task
 
             def finished(done):
@@ -173,11 +256,23 @@ def create_app(settings: Settings | None = None, transport=None):
     @app.post("/search", dependencies=[Depends(authorized)])
     @app.post("/v1/memories/search", dependencies=[Depends(authorized)])
     async def search(body: SearchRequest):
+        raw_query = body.model_dump(exclude_none=True)["query"]
+        query, ignored_images = project_text(raw_query)
+        if not query.strip():
+            return {"success": True, "data": [], "ignored_image_parts": ignored_images,
+                    "warnings": ["Image content was ignored in text-only mode. "
+                                 "No text remained; no search was performed."]}
+        # AML answer options are accepted separately. Retrieval uses the question,
+        # never a generated answer or choices injected as remembered facts.
         options = body.search_options.model_dump(exclude_none=True) if body.search_options else {}
         try:
             async with app.state.search_slots:
-                data = await app.state.upstream.search(body.query, body.user_id, body.top_k, options)
-            return {"success": True, "data": data}
+                data = await app.state.upstream.search(query, body.user_id, body.top_k, options)
+            response = {"success": True, "data": data}
+            if ignored_images:
+                response.update(ignored_image_parts=ignored_images,
+                                warnings=["Image content was ignored in text-only mode."])
+            return response
         except UpstreamError as exc:
             raise HTTPException(exc.status_code, exc.detail) from None
 

@@ -10,6 +10,12 @@
 
 默认用显式 REST `legacy` 模式：V1 Add + V2 Search。可选 `v3` 模式。官方平台算法可能已升级，兼容接口不保证复现旧榜单分数。
 
+## AML 接入范围（2026-10-23）
+
+按 [AML 文档](https://agentmemories.ai/docs) 与 [API Guide](https://agentmemories.ai/api-guide) 适配，版本为 `aml-text-compatible-2026.10.23`。默认执行用户选择的 **text-only 文本兼容模式**：文本及代码正常处理；图文数组保留所有文字，明确跳过图片，不调用视觉模型，也不需要额外的视觉 API Key。
+
+这不是完整的多模态记忆系统。提交材料应声明“文本/代码；图文输入仅保留文本，图片忽略”。纯图片 Add 成功执行空操作，纯图片 Search 成功返回空结果，使有效的图片请求不会因没有文字而报错；图片内容不会参与记忆和检索，相关题目可能失分。
+
 ## 配置与启动
 
 需要 Python 3.12。先安装下文依赖，再复制 `.env.example` 为 `.env`。填写官方 `MEM0_API_KEY`，并生成独立的 `WRAPPER_API_KEY`（例如 `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`）。两者不同；真实值只保存在本机 `.env`，不要提交或写入日志。
@@ -69,23 +75,42 @@ Add 与 Search 使用 `X-Api-Key: <WRAPPER_API_KEY>`。兼容别名 `/v1/memorie
   "session_id": "example-session-1",
   "messages": [
     {"role": "user", "content": "I prefer tea.", "timestamp": 1704067200000}
-  ],
-  "async_mode": false
+  ]
 }
 ```
 
-成功时 HTTP 200，且只在上游同步处理返回已完成结果，或异步事件成功后返回：
+有文字的 Add 只在上游同步处理返回已完成结果，或异步事件成功后返回 HTTP 200：
 
 ```json
 {"success": true, "request_id": "example-request-1", "user_id": "example-user-1", "session_id": "example-session-1"}
 ```
 
-正文及角色保持原样，`session_id` 映射上游 `run_id`；可选时间戳为 Unix **毫秒**，按原顺序保存在上游 `metadata.ldbd_message_timestamps`，不会用写入时间替换。旧服务具体如何处理时间戳已不可考，这一映射是本次重建选择。当前恢复范围为文本记忆，不接收图片/音视频 ContentPart。
+字符串正文保持原样；`role` 为 `user` 或 `assistant`，`session_id` 映射上游 `run_id`。可选时间戳为 Unix **毫秒**，按保留消息的原顺序保存到上游 `metadata.ldbd_message_timestamps`，不会替换为写入时间。旧服务具体如何处理时间戳已不可考，这一映射是本次重建选择。当前 AML 不发送 `async_mode`，无需填写；兼容旧客户端传入 `false`，但不支持 `true`。
+
+`messages[].content` 和 Search 的 `query` 均接受非空字符串或有序数组：
+
+```json
+[
+  {"type": "text", "text": "Original text before the image."},
+  {"type": "image_url", "image_url": {"url": "data:image/png;base64,<VALID_BASE64>"}},
+  {"type": "text", "text": "Original text after the image."}
+]
+```
+
+上面的 Base64 是格式占位符，测试时应使用有效编码。处理规则：
+
+- 每个 text part 原文完整保留，按顺序用换行连接；不概括、不截断文字。
+- 跳过 image part；混合 Add 中纯图片消息整条跳过，其他消息的角色、时间和顺序不变。
+- 含图片的成功响应附带 `ignored_image_parts` 数量和 `warnings`，说明图片已忽略。图片不会写入 Mem0、持久化原图或发送给其他模型。
+- 纯图片 Add 返回 HTTP 200、`success: true`、三个请求 ID 和 `no_op: true`，只持久化幂等回执，不调用 Mem0、不创建空记忆；重试及重启后复用回执，同一 ID 更换图片仍返回 409。
+- 纯图片 Search 返回 HTTP 200、`success: true`、`data: []`，不调用 Mem0。警告中说明没有可检索的文字。
+- 仍校验 AML 图片格式：仅 JPEG/PNG/WebP 的内联 Base64；拒绝远程 URL。单图解码后最多 10 MiB，Add 的图片总计最多 30 MiB；不会下载 URL 或把 Base64 当成文字记忆。这里校验编码与大小，不执行图像解析/识别。
+- 每个部分都必须符合格式；不能用“忽略图片”绕过无效载荷校验。错误响应不回显原始正文或 Base64。
 
 `POST /search`：
 
 ```json
-{"query": "What drink do I prefer?", "user_id": "example-user-1", "top_k": 100}
+{"query": "What drink do I prefer?", "options": ["A. Tea", "B. Coffee"], "user_id": "example-user-1", "top_k": 100}
 ```
 
 响应：
@@ -96,12 +121,15 @@ Add 与 Search 使用 `X-Api-Key: <WRAPPER_API_KEY>`。兼容别名 `/v1/memorie
 
 搜索强制 `filters={"user_id": ...}`，跨该用户的会话检索，不按 session 过滤。只透传可选 `search_options.threshold`（0 到 1）和 `search_options.rerank`；不能从请求注入其他用户的过滤条件。支持官方裸数组、`results`、`memories`、`data` 数组响应，结果去重并限制到 `top_k`。未知响应格式返回错误，不伪装为空结果。
 
+`top_k` 必填，正式评测填 100。顶层 `options` 是选择题文本数组，开放题省略；它和旧扩展字段 `search_options` 不是同一个字段。本服务接收选项，但仍按原问题文字检索，不将选项写入记忆、拼入问题或生成答案。Search 只返回 Mem0 的文本记忆证据，没有原图回传能力。
+
 ## 幂等与故障恢复
 
 `data/requests.sqlite3` 是持久化请求账本；保存 ID、输入摘要、事件 ID、状态和成功回执，不保存聊天正文或 Key。请与代码一起保留，勿在重启或迁移时删除。
 
 - 同一 `(user_id, request_id)`、相同输入：复用已完成回执；并发重复请求等待同一个任务。
 - 同一标识但不同输入：409，`request_id is bound to a different payload`。
+- 幂等摘要涵盖原始图文输入，图片虽被忽略，同一 request_id 更换图片仍视为不同载荷。
 - 上游异步返回事件：先持久化事件 ID，再轮询；单次等待默认 600 秒，超时返回 504。后续同一请求继续轮询，不重新写入。
 - 写入超时、网络中断或 5xx：结果可能已被上游接受，记为 `uncertain`；后续返回 503，禁止自动重复写入。
 - 进程在提交期间退出且未持久化事件/结果：同样视为结果不确定。
@@ -123,6 +151,8 @@ Add 与 Search 使用 `X-Api-Key: <WRAPPER_API_KEY>`。兼容别名 `/v1/memorie
 ```
 
 测试使用 `httpx.MockTransport`，覆盖请求契约、鉴权、用户隔离、重复写入、重启恢复、异步成功/失败/超时、不确定写入、429 和 legacy/V3 路由。它们不调用真实官方服务，也不会生成真实记忆或消耗 Mem0 额度。真实 Add/Search 联调需填入官方 Key 后单独完成。
+
+新增 AML 合同测试覆盖 `options`、有序 text parts、跳过图片、纯图片空操作及幂等恢复、图片大小和 Base64 校验。部署提交前仍需：填写官方 Key、设置远程可达地址、确认网络访问、运行平台 Smoke。不要将本地模拟测试结果写成平台 Smoke 已通过。公开提交说明模板见 `SUBMISSION.md`。
 
 ## 依据
 
