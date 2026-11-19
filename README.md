@@ -1,72 +1,105 @@
-# LDBD Mem0 官方平台适配服务（兼容重建版）
+# Mem0 AML Adapter
 
-重建时间：2026-10-22。旧服务器源码已丢失；本目录依据原接入记录、评测协议和 Mem0 官方 REST 契约重新实现，**不是原源码的逐字恢复**。
+将 **Mem0 官方托管服务**封装为 AML 评测接受的 Add / Search HTTP 接口。适配层负责请求格式转换、鉴权、用户隔离、写入状态跟踪和幂等回执；记忆提取与检索由 Mem0 官方 API 提供。
 
-## 已恢复的边界
+本仓库公开的是接口适配代码，不包含 Mem0 托管后端、模型或实现。支持文本与代码输入；图文输入采用**保留文本、忽略图片**的兼容方式，不提供图像理解能力。
 
-- 原登记系统：`mem0-api v3`，工业榜、`participant_api`。
-- 原运行配置：同步 Add、每块 20 条消息、Top K 100、写入及检索并发各 64。分块由评测端负责，服务端不再次分块。
-- 原始 Mem0 官方 Key、服务源码、内部算法选项和上游版本没有恢复。原记录的 `v3` 是本地封装版本名，不能据此认定使用了 Mem0 V3 API。
+## 功能概览
 
-默认用显式 REST `legacy` 模式：V1 Add + V2 Search。可选 `v3` 模式。官方平台算法可能已升级，兼容接口不保证复现旧榜单分数。
+- 提供 AML 格式的 `POST /add`、`POST /search`，以及健康检查接口。
+- 使用独立的访问密钥保护适配层，Mem0 官方密钥仅保存在部署环境。
+- 按 `user_id` 隔离检索范围，跨该用户的会话检索。
+- 使用 SQLite 保存请求状态和成功回执，支持重复请求去重、重启恢复和异步事件对账。
+- 对长会话按固定规则分段，保留文本顺序、角色和毫秒时间戳。
+- 接受有序图文内容数组；忽略图片，明确返回兼容处理说明。
 
-## AML 接入范围（2026-10-23）
+默认 `legacy` 模式使用 Mem0 V1 Add 和 V2 Search，也可通过配置选择 `v3` 模式。适配层版本与 Mem0 API 版本分别管理。
 
-按 [AML 文档](https://agentmemories.ai/docs) 与 [API Guide](https://agentmemories.ai/api-guide) 适配，版本为 `aml-text-compatible-2026.10.23`。默认执行用户选择的 **text-only 文本兼容模式**：文本及代码正常处理；图文数组保留所有文字，明确跳过图片，不调用视觉模型，也不需要额外的视觉 API Key。
+## 快速开始
 
-这不是完整的多模态记忆系统。提交材料应声明“文本/代码；图文输入仅保留文本，图片忽略”。纯图片 Add 成功执行空操作，纯图片 Search 成功返回空结果，使有效的图片请求不会因没有文字而报错；图片内容不会参与记忆和检索，相关题目可能失分。
-
-## 配置与启动
-
-需要 Python 3.12。先安装下文依赖，再复制 `.env.example` 为 `.env`。填写官方 `MEM0_API_KEY`，并生成独立的 `WRAPPER_API_KEY`（例如 `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`）。两者不同；真实值只保存在本机 `.env`，不要提交或写入日志。
+使用 Python 3.12，在仓库根目录执行：
 
 ```bash
-cd /absolute/path/to/ldbd_mem0
-# 初次安装；已有 .env 时跳过复制，避免覆盖
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
 cp .env.example .env
 chmod 600 .env
-nano .env
+```
+
+编辑 `.env`，填写以下两项：
+
+- `MEM0_API_KEY`：Mem0 官方 API Key。
+- `WRAPPER_API_KEY`：评测客户端访问本服务时使用的独立密钥。
+
+可用下面的命令生成访问密钥，将结果保存到 `.env`：
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+启动服务：
+
+```bash
 .venv/bin/python scripts/run.py
 ```
 
-默认监听 `127.0.0.1:8894`。需要供远程评测器使用时，将 `.env` 的 `HOST` 改为合适的网卡地址或 `0.0.0.0`，并按服务器网络策略开放访问。服务不会自行改动防火墙或旧榜单绑定。
+默认监听 `127.0.0.1:8894`。供远程评测使用时，按部署环境设置 `HOST`、`PORT` 和网络访问规则。已有 `.env` 时无需再次复制示例文件。
 
-长期运行可使用通用用户级 systemd 模板，先把模板中的路径改成实际目录：
+### 主要配置
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `MEM0_BASE_URL` | `https://api.mem0.ai` | Mem0 官方服务地址，要求 HTTPS |
+| `MEM0_API_MODE` | `legacy` | `legacy` 或 `v3` |
+| `HOST` | `127.0.0.1` | 监听地址 |
+| `PORT` | `8894` | 监听端口 |
+| `REQUEST_DB_PATH` | `data/requests.sqlite3` | 持久化请求账本 |
+| `UPSTREAM_TIMEOUT_SECONDS` | `60` | 单次上游请求超时，单位秒 |
+| `ADD_WAIT_SECONDS` | `600` | 异步事件等待时长，单位秒 |
+| `POLL_INTERVAL_SECONDS` | `1` | 前台事件轮询间隔，单位秒 |
+| `MAX_ADD_CONCURRENCY` | `64` | Add 并发上限 |
+| `MAX_SEARCH_CONCURRENCY` | `64` | Search 并发上限 |
+| `RECONCILE_INTERVAL_SECONDS` | `30` | 后台每轮对账结束后的等待时间 |
+| `RECONCILE_BATCH_SIZE` | `100` | 每轮最多检查的请求数 |
+
+并发上限不代表 Mem0 账号的实际吞吐额度，应结合账号限制和评测要求调整。长会话包含多次上游写入，端到端耗时可能超过单次上游请求的超时设置。
+
+### 使用 systemd
+
+仓库提供通用用户级模板。将模板中的 `/absolute/path/to/ldbd_mem0` 替换为实际仓库目录后使用：
 
 ```bash
 mkdir -p ~/.config/systemd/user
 cp deploy/ldbd-mem0.service.example ~/.config/systemd/user/ldbd-mem0.service
-nano ~/.config/systemd/user/ldbd-mem0.service
+# 编辑服务文件中的 WorkingDirectory 和 ExecStart
 systemctl --user daemon-reload
-systemctl --user enable --now ldbd-mem0
-systemctl --user status ldbd-mem0
-# 修改 .env 后：
-systemctl --user restart ldbd-mem0
+systemctl --user enable --now ldbd-mem0.service
+systemctl --user status ldbd-mem0.service
 ```
 
-注销后用户服务是否继续运行，取决于服务器的 user lingering 配置；本项目不更改该系统设置。
-
-全新机器安装依赖：
-
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements-dev.txt
-```
-
-如果系统缺少 `ensurepip/python3-venv` 但提供 pip 24，可用不需要 sudo 的方式：
-
-```bash
-python3 -m venv --without-pip .venv
-python3 -m pip --python .venv/bin/python install -r requirements-dev.txt
-```
+修改 `.env` 后执行 `systemctl --user restart ldbd-mem0.service`。注销后能否继续运行取决于服务器的用户服务配置。
 
 ## API
 
-`GET /live` 返回进程存活状态。`GET /health` 无需鉴权；两个 Key 都配置后返回 200，否则 503。Health 不调用官方 API，因此不能证明 Key 有效或官方网络可达。
+Add 与 Search 均使用请求头：
 
-Add 与 Search 使用 `X-Api-Key: <WRAPPER_API_KEY>`。兼容别名 `/v1/memories/add`、`/v1/memories/search` 提供相同语义。
+```http
+Content-Type: application/json
+X-Api-Key: <WRAPPER_API_KEY>
+```
 
-`POST /add`：
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| `POST` | `/add` | 写入文本记忆并返回处理回执 |
+| `POST` | `/search` | 检索文本记忆证据 |
+| `GET` | `/live` | 检查进程存活状态 |
+| `GET` | `/health` | 检查两个密钥是否已配置 |
+
+兼容别名 `/v1/memories/add`、`/v1/memories/search` 与主接口语义相同。健康检查无需鉴权；`/health` 在两个密钥均已配置时返回 200，否则返回 503。它不调用 Mem0，不能用来确认密钥有效性或上游连通性。
+
+### Add
+
+请求示例：
 
 ```json
 {
@@ -79,15 +112,50 @@ Add 与 Search 使用 `X-Api-Key: <WRAPPER_API_KEY>`。兼容别名 `/v1/memorie
 }
 ```
 
-有文字的 Add 只在上游同步处理返回已完成结果，或异步事件成功后返回 HTTP 200：
+文本写入在 Mem0 返回完成结果或异步事件确认成功后，返回 HTTP 200：
 
 ```json
-{"success": true, "request_id": "example-request-1", "user_id": "example-user-1", "session_id": "example-session-1"}
+{
+  "success": true,
+  "request_id": "example-request-1",
+  "user_id": "example-user-1",
+  "session_id": "example-session-1"
+}
 ```
 
-字符串正文保持原样；`role` 为 `user` 或 `assistant`，`session_id` 映射上游 `run_id`。可选时间戳为 Unix **毫秒**，按保留消息的原顺序保存到上游 `metadata.ldbd_message_timestamps`，不会替换为写入时间。旧服务具体如何处理时间戳已不可考，这一映射是本次重建选择。当前 AML 不发送 `async_mode`，无需填写；兼容旧客户端传入 `false`，但不支持 `true`。
+`role` 支持 `user` 和 `assistant`。`session_id` 映射为 Mem0 的 `run_id`。可选 `timestamp` 使用 Unix 毫秒，按消息顺序保存到上游 `metadata.ldbd_message_timestamps`。字符串文本保持原样。`async_mode` 可省略；兼容值为 `false`，不支持 `true`。
 
-`messages[].content` 和 Search 的 `query` 均接受非空字符串或有序数组：
+### Search
+
+```json
+{
+  "query": "What drink do I prefer?",
+  "options": ["A. Tea", "B. Coffee"],
+  "user_id": "example-user-1",
+  "top_k": 100
+}
+```
+
+响应示例：
+
+```json
+{
+  "success": true,
+  "data": [
+    {"id": "memory-id", "content": "User prefers tea.", "score": 0.8}
+  ]
+}
+```
+
+- `top_k` 必填，支持 1 到 1000；实际提交值按评测配置填写。
+- `options` 是可选的选择题选项数组，开放题可省略。服务仍使用原问题检索，不生成最终答案。
+- 可通过 `search_options.threshold`（0 到 1）和 `search_options.rerank` 调整检索。
+- 检索强制限定相同的 `user_id`，不按 `session_id` 过滤。不同评测若需要隔离，应使用不同的 `user_id`；Add/Search 均拒绝带 `*` 的用户 ID。
+- 结果去重后限制为最多 `top_k` 条。未知上游响应格式会返回错误。
+
+### 图文兼容处理
+
+`messages[].content` 与 Search 的 `query` 均支持非空字符串或有序内容数组：
 
 ```json
 [
@@ -97,89 +165,66 @@ Add 与 Search 使用 `X-Api-Key: <WRAPPER_API_KEY>`。兼容别名 `/v1/memorie
 ]
 ```
 
-上面的 Base64 是格式占位符，测试时应使用有效编码。处理规则：
+示例中的 Base64 是格式占位符，实际请求应使用有效编码。
 
-- 每个 text part 原文完整保留，按顺序用换行连接；不概括、不截断文字。
-- 跳过 image part；混合 Add 中纯图片消息整条跳过，其他消息的角色、时间和顺序不变。
-- 含图片的成功响应附带 `ignored_image_parts` 数量和 `warnings`，说明图片已忽略。图片不会写入 Mem0、持久化原图或发送给其他模型。
-- 纯图片 Add 返回 HTTP 200、`success: true`、三个请求 ID 和 `no_op: true`，只持久化幂等回执，不调用 Mem0、不创建空记忆；重试及重启后复用回执，同一 ID 更换图片仍返回 409。
-- 纯图片 Search 返回 HTTP 200、`success: true`、`data: []`，不调用 Mem0。警告中说明没有可检索的文字。
-- 仍校验 AML 图片格式：仅 JPEG/PNG/WebP 的内联 Base64；拒绝远程 URL。单图解码后最多 10 MiB，Add 的图片总计最多 30 MiB；不会下载 URL 或把 Base64 当成文字记忆。这里校验编码与大小，不执行图像解析/识别。
-- 每个部分都必须符合格式；不能用“忽略图片”绕过无效载荷校验。错误响应不回显原始正文或 Base64。
+文本部分按原顺序用换行连接，图片部分被忽略。混合 Add 中没有文本的消息会被跳过；其余消息保留角色、顺序和时间戳。含图片的成功响应附带 `ignored_image_parts` 和 `warnings`。
 
-`POST /search`：
+纯图片 Add 返回 HTTP 200、`success: true`、三个请求 ID 和 `no_op: true`，仅保存幂等回执，不调用 Mem0。纯图片 Search 返回 HTTP 200、`success: true` 和 `data: []`。图片内容不参与记忆或检索，相关评测结果应按文本兼容能力理解。
 
-```json
-{"query": "What drink do I prefer?", "options": ["A. Tea", "B. Coffee"], "user_id": "example-user-1", "top_k": 100}
-```
-
-响应：
-
-```json
-{"success": true, "data": [{"id": "memory-id", "content": "User prefers tea.", "score": 0.8}]}
-```
-
-搜索强制 `filters={"user_id": ...}`，跨该用户的会话检索，不按 session 过滤。只透传可选 `search_options.threshold`（0 到 1）和 `search_options.rerank`；不能从请求注入其他用户的过滤条件。支持官方裸数组、`results`、`memories`、`data` 数组响应，结果去重并限制到 `top_k`。未知响应格式返回错误，不伪装为空结果。
-
-`top_k` 必填，正式评测填 100。顶层 `options` 是选择题文本数组，开放题省略；它和旧扩展字段 `search_options` 不是同一个字段。本服务接收选项，但仍按原问题文字检索，不将选项写入记忆、拼入问题或生成答案。Search 只返回 Mem0 的文本记忆证据，没有原图回传能力。
+图片仍须符合输入格式：仅接受内联 Base64 JPEG、PNG、WebP，拒绝远程 URL；单图解码后最多 10 MiB，单次 Add 图片总计最多 30 MiB。服务校验编码和大小，不执行图像识别，也不向上游发送或持久化原图。错误响应不回显原始正文或 Base64。
 
 ## 幂等与故障恢复
 
-`data/requests.sqlite3` 是持久化请求账本；保存 ID、输入摘要、事件 ID、状态和成功回执，不保存聊天正文或 Key。请与代码一起保留，勿在重启或迁移时删除。
+请求账本保存 ID、输入摘要、事件 ID、状态和成功回执，不保存聊天正文或密钥。部署迁移和重启时应保留账本。
 
-- 同一 `(user_id, request_id)`、相同输入：复用已完成回执；并发重复请求等待同一个任务。
-- 同一标识但不同输入：409，`request_id is bound to a different payload`。
-- 幂等摘要涵盖原始图文输入，图片虽被忽略，同一 request_id 更换图片仍视为不同载荷。
-- 上游异步返回事件：先持久化事件 ID，再轮询；单次等待默认 600 秒，超时返回 504。后续同一请求继续轮询，不重新写入。
-- 写入超时、网络中断或 5xx：结果可能已被上游接受，记为 `uncertain`；后续返回 503，禁止自动重复写入。
-- 进程在提交期间退出且未持久化事件/结果：同样视为结果不确定。
-- 明确 429 拒绝：后续同一请求允许重试。上游事件明确失败不会报告成功。
-- Search 和事件 GET 最多重试三次；Add 不对不确定结果自动重试，也不会自动切换 API 版本重发。
+- 同一 `(user_id, request_id)` 与相同输入复用已完成回执，并发重复请求等待同一个任务；相同标识与不同输入返回 409。摘要涵盖原始图文输入，忽略图片不改变幂等校验规则。
+- 异步事件 ID 会先持久化再轮询。等待超时返回 504；已有事件的后续请求继续查询状态，不重新写入。
+- 写入超时、网络中断或部分 5xx 可能意味着上游已接受请求，此时保留不确定状态，不盲目重发。明确 429 拒绝可在后续请求中重试。
+- 后台仅查询已保存的事件；全部事件确认成功后更新本地回执。它不会重新 POST 记忆，也不会将未知或失败状态报告为成功。
+- 对账跳过正在处理的请求，并轮转检查；探测并发为 4，单个事件最多等待 10 秒，整批最多等待 30 秒，每条请求每轮最多检查 4 个事件。
+- 已完成状态不会被迟到的失败结果覆盖。没有事件 ID 的不确定写入需先核查上游记录，不能通过清空账本或更换请求 ID 重放。
 
-这是在缺少官方幂等提交保证时的保守恢复策略，不保证跨网络/数据库故障的 exactly-once。遇到 `uncertain`，应先由运维按上游记录核对；不要直接清空账本或换 request_id 重放。原评测端存在跳过部分 409 的补丁；本次恢复不会将“正在处理”直接报告为成功。
+长会话采用固定 `partition-v1` 计划，按顺序拆为每次最多 20 条消息、20,000 字符的上游请求。超长正文按字符拆分，保留全部文本、角色和时间戳；无法满足非空消息约束时显式报错。
 
-仅使用单个 Uvicorn worker；不要使用多 worker 或多个实例共享此账本。新旧环境不要复用真实用户 ID 做测试；实际冒烟测试应使用独立的随机 user_id。
+内部子请求使用确定性的 `ldbd-part:` ID，分别保存处理状态，全部完成后才返回父请求成功。重试复用完成部分，继续尚未提交的部分或查询已有事件；不重发不确定部分。后台只确认已有子请求的完成状态，恢复尚未提交部分需要客户端提供原始请求。统计外部请求时应排除 `ldbd-part:` 前缀。
 
-重启后需客户端重放相同 `/add` 请求才会继续查询已记录的异步事件。更换 Mem0 账号或项目时，必须使用不同的 `REQUEST_DB_PATH`，旧项目的已完成回执不能代表新项目已写入。为避免 Mem0 的通配符语义突破用户隔离，Add/Search 都拒绝含 `*` 的 user_id。官方鉴权拒绝返回 503，修复 Key 后可重试；上游 409 映射为 502 并标记不确定，不触发旧评测器跳过 409 的行为。
+已经向上游提交的旧请求不会自动改为分段重发。修复历史失败前，应先核对原始输入、事件和上游存储结果，避免重复写入。本服务不承诺跨网络和数据库故障的严格 exactly-once。
 
-## 验证
+可手动执行一次事件对账：
 
 ```bash
+.venv/bin/python scripts/reconcile_events.py
+# 限定已有请求，可重复传入该参数
+.venv/bin/python scripts/reconcile_events.py --request-id <existing-request-id>
+```
+
+仅运行单个 Uvicorn worker，不要让多个实例共享同一账本。更换 Mem0 账号或项目时，应使用独立的 `REQUEST_DB_PATH`；旧项目的成功回执不代表新项目已有相应数据。
+
+## 测试与 AML 提交
+
+安装测试依赖并验证：
+
+```bash
+.venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m pytest -q
 .venv/bin/python -m compileall -q app scripts
 .venv/bin/python scripts/check_startup.py
 ```
 
-测试使用 `httpx.MockTransport`，覆盖请求契约、鉴权、用户隔离、重复写入、重启恢复、异步成功/失败/超时、不确定写入、429 和 legacy/V3 路由。它们不调用真实官方服务，也不会生成真实记忆或消耗 Mem0 额度。真实 Add/Search 联调需填入官方 Key 后单独完成。
+测试通过模拟上游覆盖接口契约、鉴权、用户隔离、图文兼容、幂等、分段写入、异步事件和故障恢复，不调用真实 Mem0 API。接入评测前，使用独立测试用户完成真实 Add / Search 联调，再运行平台 Smoke。提交字段与能力说明见 [SUBMISSION.md](SUBMISSION.md)。
 
-新增 AML 合同测试覆盖 `options`、有序 text parts、跳过图片、纯图片空操作及幂等恢复、图片大小和 Base64 校验。部署提交前仍需：填写官方 Key、设置远程可达地址、确认网络访问、运行平台 Smoke。不要将本地模拟测试结果写成平台 Smoke 已通过。公开提交说明模板见 `SUBMISSION.md`。
+## 公开发布
 
-## 依据
+- 仅提交密钥为空的 `.env.example`，真实密钥保存在各部署环境的 `.env`。
+- `.gitignore` 排除运行数据库、日志、虚拟环境、私有说明和机器专属配置。分享部署方式时使用通用模板。
+- 发布前运行 `python3 scripts/check_secrets.py --all`；暂存后再次运行 `python3 scripts/check_secrets.py` 检查实际提交内容。
+- 检查 Git 历史和提交作者信息。`.gitignore` 不会移除已提交内容，也不会隐藏历史中的个人信息。
+- 分享源码文件时不要包含 `.git`、`.env`、数据库、日志或私有备份。仓库地址和凭证配置不应含明文 Token。
 
-官方资料：
+## 参考资料
 
-- [旧 Python SDK v0.1.118](https://github.com/mem0ai/mem0/blob/v0.1.118/mem0/client/main.py#L119-L156)
-- [旧 OpenAPI：V1 Add、V2 Search](https://github.com/mem0ai/mem0/blob/v0.1.118/docs/openapi.json)
-- [V1/V2 向后兼容与平台迁移说明](https://docs.mem0.ai/migration/platform-v2-to-v3#backward-compatibility)
-- [当前 Add](https://docs.mem0.ai/api-reference/memory/add-memories)
-- [异步事件状态](https://docs.mem0.ai/api-reference/events/get-event)
-
-## 公开仓库与密钥
-
-- 提交 `.env.example`，其中密钥项必须保持空值；每个部署环境自行创建 `.env`。
-- `.gitignore` 排除 `.env*`（例外 `.env.example`）、虚拟环境、数据库、日志、私有运维说明、机器专属 systemd 单元及恢复归档。使用 `deploy/ldbd-mem0.service.example` 分享部署模板。
-- `.gitignore` 不会移除已经暂存或已提交的文件。若文件已被跟踪，应先 `git rm --cached -- <文件>`；真实密钥一旦公开，还需要更换密钥并清理历史。
-- 检查发布候选文件：`python3 scripts/check_secrets.py --all`。暂存后运行 `python3 scripts/check_secrets.py`，检查实际 Git index，而非仅检查工作副本。
-- 检查器阻止常见凭证格式、与本机 `.env`/origin 凭证相同的值，以及误选的运行文件；它无法识别全部秘密，请结合人工审查及 GitHub Secret scanning / Push protection。
-- Git remote URL 不应嵌入 Token；优先使用 SSH 或凭证管理器。`.git/config` 不属于正常提交内容，但不要将其复制进文档、日志或归档。
-
-可选本地 pre-commit hook（不会随 clone 自动安装；已有 hook 时应合并检查步骤）：
-
-```sh
-#!/bin/sh
-set -eu
-cd "$(git rev-parse --show-toplevel)"
-exec python3 scripts/check_secrets.py
-```
-
-将以上内容保存为 `.git/hooks/pre-commit` 并 `chmod 700 .git/hooks/pre-commit`。不要使用 `git add -f` 强制加入被忽略的配置。
+- [AML 使用文档](https://agentmemories.ai/docs)
+- [AML API Guide](https://agentmemories.ai/api-guide)
+- [Mem0 开源项目](https://github.com/mem0ai/mem0)
+- [Mem0 Add API](https://docs.mem0.ai/api-reference/memory/add-memories)
+- [Mem0 异步事件查询](https://docs.mem0.ai/api-reference/events/get-event)

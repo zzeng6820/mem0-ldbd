@@ -1,5 +1,5 @@
 [Unit]
-Description=LDBD Mem0 Platform adapter
+Description=Mem0 AML Adapter
 After=network-online.target
 
 [Service]

@@ -14,6 +14,8 @@ class Settings:
     add_wait_seconds: float = 600
     max_add_concurrency: int = 64
     max_search_concurrency: int = 64
+    reconcile_interval_seconds: float = 30
+    reconcile_batch_size: int = 100
 
     def __post_init__(self):
         if self.mem0_api_mode not in {"legacy", "v3"}:
@@ -22,7 +24,8 @@ class Settings:
             raise ValueError("MEM0_BASE_URL must use HTTPS")
         if min(self.upstream_timeout_seconds, self.poll_interval_seconds,
                self.add_wait_seconds, self.max_add_concurrency,
-               self.max_search_concurrency) <= 0:
+               self.max_search_concurrency, self.reconcile_interval_seconds,
+               self.reconcile_batch_size) <= 0:
             raise ValueError("Timeouts, polling interval and concurrency must be positive")
 
     @classmethod
@@ -38,4 +41,6 @@ class Settings:
             add_wait_seconds=float(os.getenv("ADD_WAIT_SECONDS", "600")),
             max_add_concurrency=int(os.getenv("MAX_ADD_CONCURRENCY", "64")),
             max_search_concurrency=int(os.getenv("MAX_SEARCH_CONCURRENCY", "64")),
+            reconcile_interval_seconds=float(os.getenv("RECONCILE_INTERVAL_SECONDS", "30")),
+            reconcile_batch_size=int(os.getenv("RECONCILE_BATCH_SIZE", "100")),
         )

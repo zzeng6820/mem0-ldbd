@@ -214,6 +214,121 @@ class Mem0Upstream:
                     raise UpstreamError(504, "Mem0 event wait timed out", retryable=True)
                 await asyncio.sleep(min(max(float(self.settings.poll_interval_seconds), 0.01), remaining))
 
+    async def inspect_events(
+        self,
+        event_ids: list[str],
+        *,
+        user_id: str,
+        request_id: str,
+        receipt: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Read event state and prove ownership before reconstructing a receipt.
+
+        A saved receipt supplies the original session for newer records. Older
+        records must establish all three identifiers from every event payload.
+        This method never submits, retries, or changes a memory write.
+        """
+        if (
+            not isinstance(user_id, str) or not user_id.strip()
+            or not isinstance(request_id, str) or not request_id.strip()
+            or not isinstance(event_ids, list)
+            or any(not isinstance(item, str) or not item.strip() for item in event_ids)
+        ):
+            raise UpstreamError(502, "Invalid persisted event inspection identifiers")
+
+        def identity_error() -> UpstreamError:
+            return UpstreamError(502, "Mem0 event identity could not be verified")
+
+        session_id: str | None = None
+        if receipt is not None:
+            if (
+                not isinstance(receipt, dict)
+                or receipt.get("success") is not True
+                or receipt.get("user_id") != user_id
+                or receipt.get("request_id") != request_id
+                or not isinstance(receipt.get("session_id"), str)
+                or not receipt["session_id"].strip()
+            ):
+                raise identity_error()
+            session_id = receipt["session_id"]
+
+        states: list[str] = []
+        for event_id in dict.fromkeys(event_ids):
+            event = await self._request("GET", f"/v1/event/{quote(event_id, safe='')}/")
+            if not isinstance(event, dict):
+                raise self._protocol_error()
+            raw_status = event.get("status")
+            if not isinstance(raw_status, str) or not raw_status.strip():
+                raise self._protocol_error()
+            if "success" in event and not isinstance(event["success"], bool):
+                raise self._protocol_error()
+            if event.get("error") is not None and not isinstance(event["error"], (str, bool)):
+                raise self._protocol_error()
+            for key in ("id", "event_id"):
+                if key in event and event[key] != event_id:
+                    raise identity_error()
+
+            payload = event.get("payload")
+            if payload is None:
+                payload = {}
+            if not isinstance(payload, dict):
+                raise self._protocol_error()
+            payload_metadata = payload.get("metadata")
+            if payload_metadata is None:
+                payload_metadata = {}
+            event_metadata = event.get("metadata")
+            if event_metadata is None:
+                event_metadata = {}
+            if not isinstance(payload_metadata, dict) or not isinstance(event_metadata, dict):
+                raise self._protocol_error()
+
+            if receipt is None:
+                candidate_session = payload.get("run_id")
+                if (
+                    payload.get("user_id") != user_id
+                    or payload_metadata.get("request_id") != request_id
+                    or not isinstance(candidate_session, str)
+                    or not candidate_session.strip()
+                ):
+                    raise identity_error()
+                if session_id is None:
+                    session_id = candidate_session
+
+            # Optional identifiers are still authoritative when present. This
+            # also rejects conflicts hidden in the event's top-level metadata.
+            for source in (event, payload):
+                for key, expected in (("user_id", user_id), ("request_id", request_id)):
+                    if key in source and source[key] != expected:
+                        raise identity_error()
+                for key in ("run_id", "session_id"):
+                    if key in source and source[key] != session_id:
+                        raise identity_error()
+            for metadata in (payload_metadata, event_metadata):
+                if "request_id" in metadata and metadata["request_id"] != request_id:
+                    raise identity_error()
+
+            status = _status(raw_status)
+            if status in _FAILED or event.get("success") is False or event.get("error"):
+                states.append("failed")
+            elif status in _SUCCESS:
+                states.append("completed")
+            elif status in _PENDING:
+                states.append("pending")
+            else:
+                states.append("unknown")
+
+        if not states:
+            status = "unknown"
+        elif "failed" in states:
+            status = "failed"
+        elif "unknown" in states:
+            status = "unknown"
+        elif "pending" in states:
+            status = "pending"
+        else:
+            status = "completed"
+        return {"completed": status == "completed", "status": status, "session_id": session_id}
+
     async def search(
         self, query: str, user_id: str, top_k: int, options: dict[str, Any]
     ) -> list[dict[str, Any]]:

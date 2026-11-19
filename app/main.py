@@ -14,6 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from .config import Settings
 from .content import Content, MAX_ADD_IMAGE_BYTES, add_image_bytes, project_text
+from .reconciliation import EventReconciler
+from .partitioning import split_messages, part_request_id
 from .store import RequestStore
 from .upstream import Mem0Upstream, UpstreamError
 
@@ -96,12 +98,22 @@ def create_app(settings: Settings | None = None, transport=None):
                                                         max_keepalive_connections=80),
         ) as client:
             app.state.upstream = Mem0Upstream(settings, client)
-            yield
-            for task in tasks.values():
-                task.cancel()
-            await asyncio.gather(*tasks.values(), return_exceptions=True)
+            app.state.reconciler = EventReconciler(
+                app.state.store, app.state.upstream, tasks, batch_size=settings.reconcile_batch_size)
+            worker = asyncio.create_task(app.state.reconciler.run(
+                settings.reconcile_interval_seconds)) if settings.mem0_api_key else None
+            try:
+                yield
+            finally:
+                if worker:
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
+                pending = list(tasks.values())
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
 
-    app = FastAPI(title="LDBD Mem0 compatible service", version="aml-text-compatible-2026.10.23",
+    app = FastAPI(title="LDBD Mem0 compatible service", version="aml-text-compatible-2026.10.27",
                   lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
     @app.exception_handler(RequestValidationError)
@@ -163,13 +175,22 @@ def create_app(settings: Settings | None = None, transport=None):
     async def live():
         return {"status": "ok"}
 
-    async def perform_add(payload, existing, is_new, ignored_images=0):
+    async def perform_add(payload, existing, is_new, receipt):
         store = app.state.store
         user, request = payload["user_id"], payload["request_id"]
         try:
             async with app.state.add_slots:
                 event_ids = json.loads(existing.get("event_ids") or "[]")
-                if is_new or existing["state"] == "retryable":
+                if event_ids and not is_new:
+                    # A retry can supply the original receipt for a legacy row.
+                    # Reject conflicting event ownership before resuming polling.
+                    inspected = await app.state.upstream.inspect_events(
+                        event_ids, user_id=user, request_id=request, receipt=receipt)
+                    if inspected["completed"]:
+                        return store.complete(user, request, receipt)
+                # An event ID proves submission already occurred. Even a
+                # retryable/failed state must never cause another POST for it.
+                if not event_ids and (is_new or existing["state"] == "retryable"):
                     store.update(user, request, "submitted")
                     result = await app.state.upstream.submit_add(payload)
                     event_ids = result.get("event_ids", [])
@@ -177,17 +198,16 @@ def create_app(settings: Settings | None = None, transport=None):
                         store.update(user, request, "pending", event_ids=event_ids)
                     elif result.get("completed") is not True:
                         raise UpstreamError(502, "Unrecognized upstream add response", ambiguous=True)
+                elif not event_ids:
+                    raise UpstreamError(503, "No tracked event; previous write requires reconciliation",
+                                        ambiguous=True)
                 if event_ids:
                     await app.state.upstream.wait_events(event_ids)
-                response = {"success": True, "request_id": request, "user_id": user,
-                            "session_id": payload["session_id"]}
-                if ignored_images:
-                    response.update(ignored_image_parts=ignored_images,
-                                    warnings=["Image content was ignored in text-only mode."])
-                store.update(user, request, "completed", response=response)
-                return response
+                return store.complete(user, request, receipt)
         except UpstreamError as exc:
             row = store.get(user, request)
+            if row and row["state"] == "completed":
+                return json.loads(row["response"])
             has_events = bool(row and json.loads(row.get("event_ids") or "[]"))
             if exc.ambiguous:
                 state = "uncertain"
@@ -196,6 +216,9 @@ def create_app(settings: Settings | None = None, transport=None):
             else:
                 state = "failed"
             store.update(user, request, state, error=exc.detail, status_code=exc.status_code)
+            winner = store.get(user, request)
+            if winner and winner["state"] == "completed":
+                return json.loads(winner["response"])
             raise HTTPException(exc.status_code, exc.detail) from None
 
     @app.post("/add", dependencies=[Depends(authorized)])
@@ -212,13 +235,21 @@ def create_app(settings: Settings | None = None, transport=None):
             if content.strip():
                 projected_messages.append({**message, "content": content})
         key = (body.user_id, body.request_id)
+        receipt = {"success": True, "request_id": body.request_id,
+                   "user_id": body.user_id, "session_id": body.session_id}
+        if ignored_images:
+            receipt.update(ignored_image_parts=ignored_images,
+                           warnings=["Image content was ignored in text-only mode."])
+        if not projected_messages:
+            receipt.update(no_op=True, warnings=[
+                "Image content was ignored in text-only mode. No text remained; no memories were written."])
         # Fingerprint the original request, including image parts that are skipped.
         fingerprint = hashlib.sha256(json.dumps(
             {"payload": payload, "upstream": settings.mem0_base_url, "mode": settings.mem0_api_mode},
             ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode()).hexdigest()
         store = app.state.store
-        row, is_new = store.claim(*key, fingerprint)
+        row, is_new = store.claim(*key, fingerprint, receipt=receipt)
         if row["fingerprint"] != fingerprint:
             raise HTTPException(409, "request_id is bound to a different payload")
         if row["state"] == "completed":
@@ -227,21 +258,53 @@ def create_app(settings: Settings | None = None, transport=None):
             # An image-only request is a successful local no-op. Persist its
             # receipt, including after a crash between claim and completion;
             # this branch never submits a write to the upstream service.
-            response = {"success": True, "request_id": body.request_id,
-                        "user_id": body.user_id, "session_id": body.session_id,
-                        "no_op": True, "ignored_image_parts": ignored_images,
-                        "warnings": ["Image content was ignored in text-only mode. "
-                                     "No text remained; no memories were written."]}
-            store.update(*key, "completed", response=response)
-            return response
+            return store.complete(*key, receipt)
+        parts = split_messages(projected_messages)
+        if len(parts) > 1:
+            # Existing event IDs belong to the original upstream submission;
+            # never replace that submission with partitioned writes.
+            if json.loads(row.get("event_ids") or "[]"):
+                parts = []
+            elif not is_new and not row.get("part_request_ids") and row["state"] != "repair_ready":
+                raise HTTPException(row.get("status_code") or 503,
+                                    "Previous unpartitioned write requires reconciliation before partitioning")
+            else:
+                part_ids = [part_request_id(*key, fingerprint, index) for index in range(len(parts))]
+                store.set_part_requests(*key, part_ids)
+                task = tasks.get(key)
+                if task is None:
+                    async def perform_parts():
+                        try:
+                            store.update(*key, "pending")
+                            for child_id, messages in zip(part_ids, parts):
+                                child = AddRequest(request_id=child_id, user_id=body.user_id,
+                                                   session_id=body.session_id, messages=messages)
+                                await add(child)
+                            return store.complete(*key, receipt)
+                        except HTTPException as exc:
+                            store.update(*key, "pending" if exc.status_code >= 500 else "failed",
+                                         error=exc.detail, status_code=exc.status_code)
+                            winner = store.get(*key)
+                            if winner and winner["state"] == "completed":
+                                return json.loads(winner["response"])
+                            raise
+                    task = asyncio.create_task(perform_parts())
+                    tasks[key] = task
+                    def parts_finished(done):
+                        tasks.pop(key, None)
+                        if not done.cancelled():
+                            done.exception()
+                    task.add_done_callback(parts_finished)
+                return await asyncio.shield(task)
         task = tasks.get(key)
         if task is None:
-            if row["state"] in {"uncertain", "submitted"} and not is_new:
+            has_events = bool(json.loads(row.get("event_ids") or "[]"))
+            if row["state"] in {"uncertain", "submitted"} and not is_new and not has_events:
                 raise HTTPException(503, "Previous add outcome is unknown; reconcile before resubmitting")
-            if row["state"] == "failed":
+            if row["state"] == "failed" and not has_events:
                 raise HTTPException(row["status_code"] or 502, row["error"] or "Upstream add failed")
             task = asyncio.create_task(perform_add(
-                {**payload, "messages": projected_messages}, row, is_new, ignored_images))
+                {**payload, "messages": projected_messages}, row, is_new, receipt))
             tasks[key] = task
 
             def finished(done):
